@@ -1,0 +1,107 @@
+name: Build and deploy
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    env:
+      service: redis-length-prometheus
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Docker login
+        run: docker login -u="${{ secrets.DOCKER_USERNAME }}" -p="${{ secrets.DOCKER_PASSWORD }}"
+      - name: Make test
+        run: make ci-test
+ 
+      - name: Configure AWS credentials to Ireland
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{env.service }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      #US Deploy
+      - name: Configure AWS credentials to US
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+      - name: Install Open VPN
+        run: sudo apt-get install openvpn
+      - name: Write VPN Config files
+        run: |
+          echo ${{ secrets.US_VPN_CONFIG}} |base64 -d >> .github/us-vpn.ovpn 
+          echo ${{ secrets.CA_CRT}} |base64 -d >> ca.crt
+          echo ${{ secrets.USER_CRT}} |base64 -d >> user.crt
+          echo ${{ secrets.USER_KEY}} |base64 -d >> user.key
+      - name: Open US VPN Connection
+        run: sudo openvpn --config .github/us-vpn.ovpn --daemon  
+      #US Staging   
+      - name: Configure US Staging EKS
+        run: aws eks update-kubeconfig --name us-staging-eks --region us-west-2    
+      - name: Helm upgrade US Staging
+        working-directory: ./helm
+        run: helm upgrade --install ${{env.service}} ${{env.service}} --values ${{env.service}}/us-staging-values.yaml -n staging --atomic --timeout 5m20s --set image.tag=${{ github.sha }}
+      - name: Kill VPN
+        if: always()
+        run: sudo killall openvpn || true
+
+      #UK Deploy
+      - name: Configure AWS credentials to UK
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+      - name: Write VPN Config files
+        run: |
+          echo ${{ secrets.UK_VPN_CONFIG}} |base64 -d >> .github/uk-vpn.ovpn
+          echo ${{ secrets.CA_CRT}} |base64 -d >> ca.crt
+          echo ${{ secrets.USER_CRT}} |base64 -d >> user.crt
+          echo ${{ secrets.USER_KEY}} |base64 -d >> user.key
+      - name: Open UK VPN Connection
+        run: sudo openvpn --config .github/uk-vpn.ovpn --daemon
+
+      #UK Staging
+      - name: Configure UK Staging EKS
+        run: aws eks update-kubeconfig --name uk-staging-eks --region eu-west-1
+      - name: Helm upgrade UK Staging
+        working-directory: ./helm
+        run: helm upgrade --install ${{env.service}} ${{env.service}} --values ${{env.service}}/uk-staging-values.yaml -n staging --atomic --timeout 5m20s --set image.tag=${{ github.sha }}
+      - name: Helm test UK Staging
+        run: helm test ${{env.service}} -n staging
+      - name: Helm test cleanup UK Staging
+        run:  kubectl delete pod ${{env.service}}-test-connection -n staging           
+
+      #UK Prod
+      - name: Configure UK Prod EKS
+        run: aws eks update-kubeconfig --name uk-prod-eks --region eu-west-1
+      - name: Helm upgrade UK Prod
+        working-directory: ./helm
+        run: helm upgrade --install ${{env.service}} ${{env.service}} --values ${{env.service}}/uk-prod-values.yaml -n prod --atomic --timeout 5m20s --set image.tag=${{ github.sha }}
+      - name: Helm test UK Prod
+        run: helm test ${{env.service}} -n prod
+      - name: Helm test cleanup UK Prod
+        run:  kubectl delete pod ${{env.service}}-test-connection -n prod           
+
+      - name: Kill VPN
+        if: always()
+        run: sudo killall openvpn || true
